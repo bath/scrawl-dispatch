@@ -1,0 +1,291 @@
+#!/bin/bash
+# scrawl-dispatch: sends each finished Scrawl capture to a coding agent on a Herdr machine.
+#
+# Scrawl has no "capture is done" hook yet (kitlangton/scrawl#25), so a launchd job watches the
+# captures folder. For each new capture it copies the bundle to the machine and starts Claude Code
+# there in a new Herdr tab, with the text Scrawl put on the clipboard as the prompt.
+#
+#   scrawl-dispatch install <machine>   set up the launchd job (machine: a name from `hc machine ls`)
+#   scrawl-dispatch on | off | status   the toggle
+#   scrawl-dispatch send [bundle]       send one capture now (default: the newest)
+#   scrawl-dispatch uninstall           remove the launchd job
+#   scrawl-dispatch watch               what the launchd job runs
+set -u
+
+LABEL=dev.bath.scrawl-dispatch
+CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/scrawl-dispatch"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/scrawl-dispatch"
+CONF="$CONF_DIR/config"
+FLAG="$CONF_DIR/on"
+SEEN="$STATE_DIR/seen"
+LOG="$STATE_DIR/log"
+LOCK="$STATE_DIR/lock"
+PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+INSTALLED="$HOME/.local/bin/scrawl-dispatch"
+
+# launchd gives a job a short PATH; hc and claude installers use these folders.
+PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+
+# Settings, each one overridable in $CONF (a shell file).
+MACHINE=""                # a name from `hc machine ls`
+MODEL=opus                # claude --model
+EFFORT=medium             # claude --effort
+CWD=""                    # the agent's folder on the machine (default: its home)
+SPACE=""                  # the Herdr space for the tab (default: the newest terminal's space)
+NOTIFY=1                  # 1: a macOS notification for each dispatch
+CAPTURES="$HOME/Library/Application Support/scrawl/captures"
+REMOTE_CAPTURES=scrawl/captures   # under the machine's home
+GIVE_UP_MINUTES=180       # stop waiting for a capture that never finishes (a cancelled recording)
+# shellcheck disable=SC1090
+[ -f "$CONF" ] && . "$CONF"
+
+# The video and audio stay on the Mac. The full-size frames go after the agent has started.
+LEFT_BEHIND="recording.mp4 recording.mov audio.wav"
+SENT_LATER="frames-full contact-sheet-full.png"
+
+log() {
+  mkdir -p "$STATE_DIR"
+  printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >>"$LOG"
+  [ -t 2 ] && printf '%s\n' "$*" >&2
+  return 0
+}
+
+die() {
+  log "error: $*"
+  [ -t 2 ] || printf '%s\n' "$*" >&2
+  exit 1
+}
+
+notify() {
+  [ "$NOTIFY" = 1 ] || return 0
+  /usr/bin/osascript -e 'on run argv' \
+    -e 'display notification (item 2 of argv) with title (item 1 of argv)' \
+    -e 'end run' "$1" "$2" >/dev/null 2>&1 || true
+}
+
+# The SSH target hc has for $MACHINE; empty for a machine hc reaches through a command (--via).
+ssh_target() {
+  local json count i name
+  json=$(hc machine ls --json 2>/dev/null) || return 0
+  count=$(printf '%s' "$json" | /usr/bin/plutil -extract machines raw -o - - 2>/dev/null) || return 0
+  i=0
+  while [ "$i" -lt "$count" ]; do
+    name=$(printf '%s' "$json" | /usr/bin/plutil -extract "machines.$i.name" raw -o - - 2>/dev/null)
+    if [ "$name" = "$MACHINE" ]; then
+      [ "$(printf '%s' "$json" | /usr/bin/plutil -extract "machines.$i.via" raw -o - - 2>/dev/null)" = false ] || return 0
+      printf '%s' "$json" | /usr/bin/plutil -extract "machines.$i.target" raw -o - - 2>/dev/null
+      return 0
+    fi
+    i=$((i + 1))
+  done
+}
+
+# Runs a shell script on the machine with stdin piped in. SSH is about twice as fast as hc exec.
+on_machine() {
+  if [ -n "$SSH_TARGET" ]; then
+    /usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=8 "$SSH_TARGET" "$1"
+  else
+    hc exec --on "$MACHINE" --timeout 300 -i -- sh -c "$1"
+  fi
+}
+
+# The Herdr space of the machine's newest terminal. A terminal with a space and no tab label
+# opens as a new tab in that space.
+newest_space() {
+  local address space
+  for address in $(hc ls --json 2>/dev/null | grep -o '"address":"[^"]*"' | cut -d'"' -f4 |
+    grep "^$MACHINE/" | tail -r | head -4); do
+    space=$(hc get "$address" --json 2>/dev/null | sed -n 's/.*"herdr\.space":"\([^"]*\)".*/\1/p')
+    if [ -n "$space" ]; then
+      printf '%s' "$space"
+      return 0
+    fi
+  done
+}
+
+send() {
+  local bundle="$1" name parent home remote prompt space args out address excludes file later
+  [ -n "$MACHINE" ] || die "No machine: set MACHINE in $CONF (see \`hc machine ls\`)"
+  command -v hc >/dev/null || die "hc (herdr-core) is not installed"
+  [ -f "$bundle/summary.md" ] || die "$bundle has no summary.md"
+  bundle=$(cd "$bundle" && pwd)
+  name=$(basename "$bundle")
+  parent=$(dirname "$bundle")
+  SSH_TARGET=$(ssh_target)
+  case "$SSH_TARGET" in -*) SSH_TARGET="" ;; esac
+
+  excludes=()
+  for file in $LEFT_BEHIND $SENT_LATER; do excludes+=("--exclude=*/$file"); done
+  home=$(COPYFILE_DISABLE=1 /usr/bin/tar -C "$parent" --no-xattrs "${excludes[@]}" -cf - "$name" 2>/dev/null |
+    on_machine "mkdir -p \"\$HOME/$REMOTE_CAPTURES\" && tar -C \"\$HOME/$REMOTE_CAPTURES\" -xf - && printf %s \"\$HOME\"" 2>>"$LOG")
+  case "$home" in
+    /*) ;;
+    *)
+      notify "Scrawl dispatch failed" "Couldn't copy the capture to $MACHINE"
+      die "Copying $name to $MACHINE failed"
+      ;;
+  esac
+  remote="$home/$REMOTE_CAPTURES/$name"
+
+  # The clipboard text is summary.md; its paths must point at the copy.
+  prompt=$(cat "$bundle/summary.md")
+  prompt=${prompt//"$bundle"/$remote}
+
+  space=$SPACE
+  [ -n "$space" ] || space=$(newest_space)
+  args=(run --json --bg --no-parent --keep --on "$MACHINE")
+  [ -n "$CWD" ] && args+=(--cwd "$CWD")
+  [ -n "$space" ] && args+=(--label "herdr.space=$space")
+  # The prompt goes before --add-dir, which takes every argument after it as a folder. Without
+  # --add-dir, Claude Code stops to ask before it reads the first frame.
+  args+=(-- claude "$prompt" --model "$MODEL" --effort "$EFFORT" --add-dir "$remote")
+  if ! out=$(hc "${args[@]}" 2>&1 </dev/null); then
+    notify "Scrawl dispatch failed" "Couldn't start the agent on $MACHINE"
+    die "Starting the agent on $MACHINE failed: $out"
+  fi
+  address=$(printf '%s' "$out" | grep -o '"address":"[^"]*"' | head -1 | cut -d'"' -f4)
+  log "sent $name to $MACHINE (${address:-terminal started})"
+  notify "Scrawl sent to $MACHINE" "${address:-A new tab} is working on it"
+  [ -t 1 ] && printf 'Dispatched %s to %s (%s)\n' "$remote" "$MACHINE" "${address:-terminal started}"
+
+  later=()
+  for file in $SENT_LATER; do [ -e "$bundle/$file" ] && later+=("$name/$file"); done
+  if [ "${#later[@]}" -gt 0 ]; then
+    COPYFILE_DISABLE=1 /usr/bin/tar -C "$parent" --no-xattrs -cf - "${later[@]}" 2>/dev/null |
+      on_machine "tar -C \"\$HOME/$REMOTE_CAPTURES\" -xf -" >/dev/null 2>>"$LOG" ||
+      log "the full-size frames of $name did not reach $MACHINE"
+  fi
+  return 0
+}
+
+newest_bundle() {
+  local newest
+  # shellcheck disable=SC2012
+  newest=$(ls -td "$CAPTURES"/*.scrawl 2>/dev/null | head -1)
+  [ -n "$newest" ] || die "No captures in $CAPTURES"
+  printf '%s' "$newest"
+}
+
+# Captures that exist now are never dispatched: only ones that appear later.
+mark_existing_seen() {
+  local bundle
+  mkdir -p "$STATE_DIR"
+  touch "$SEEN"
+  for bundle in "$CAPTURES"/*.scrawl; do
+    [ -d "$bundle" ] || continue
+    grep -qxF "$(basename "$bundle")" "$SEEN" || basename "$bundle" >>"$SEEN"
+  done
+}
+
+# launchd starts this when the captures folder changes, which is when Scrawl makes a bundle's
+# folder at the start of a recording. summary.md is the last file Scrawl writes, so the loop
+# waits for it, dispatches, and exits when no unfinished capture is left.
+watch() {
+  local bundle name pending
+  mkdir -p "$STATE_DIR"
+  if ! mkdir "$LOCK" 2>/dev/null; then
+    if kill -0 "$(cat "$LOCK/pid" 2>/dev/null)" 2>/dev/null; then exit 0; fi
+    rm -rf "$LOCK" && mkdir "$LOCK" || exit 0
+  fi
+  echo $$ >"$LOCK/pid"
+  trap 'rm -rf "$LOCK"' EXIT
+  [ -f "$SEEN" ] || mark_existing_seen
+  while :; do
+    pending=0
+    for bundle in "$CAPTURES"/*.scrawl; do
+      [ -d "$bundle" ] || continue
+      name=$(basename "$bundle")
+      grep -qxF "$name" "$SEEN" && continue
+      if [ -s "$bundle/summary.md" ] && [ -f "$bundle/scrawl.json" ]; then
+        echo "$name" >>"$SEEN"
+        if [ -e "$FLAG" ]; then
+          sleep 0.3 # summary.md is small, but let the write finish
+          (send "$bundle") || true
+        else
+          log "off: left $name on the Mac"
+        fi
+      elif [ -n "$(find "$bundle" -maxdepth 0 -mmin +"$GIVE_UP_MINUTES" 2>/dev/null)" ]; then
+        echo "$name" >>"$SEEN"
+        log "gave up on $name: it never finished"
+      else
+        pending=1
+      fi
+    done
+    [ "$pending" = 1 ] || break
+    sleep 1
+  done
+}
+
+install() {
+  local machine="${1:-$MACHINE}" source
+  [ -n "$machine" ] || die "Usage: scrawl-dispatch install <machine>   (a name from \`hc machine ls\`)"
+  command -v hc >/dev/null || die "hc (herdr-core) is not installed: https://herdr.dev"
+  hc machine ls --json 2>/dev/null | grep -q "\"name\":\"$machine\"" ||
+    die "hc has no machine named $machine (see \`hc machine ls\`)"
+  mkdir -p "$CONF_DIR" "$STATE_DIR" "$(dirname "$INSTALLED")" "$(dirname "$PLIST")" "$CAPTURES"
+  source=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
+  [ "$source" = "$INSTALLED" ] || cp "$source" "$INSTALLED"
+  chmod +x "$INSTALLED"
+  if [ ! -f "$CONF" ]; then
+    cat >"$CONF" <<EOF
+# scrawl-dispatch settings (a shell file). \`scrawl-dispatch status\` shows what is in effect.
+MACHINE=$machine
+MODEL=opus
+EFFORT=medium
+# The agent's folder on the machine. Use one Claude Code already trusts there, or the agent
+# stops at the trust question. Empty: the machine's home.
+CWD=
+EOF
+  fi
+  mark_existing_seen
+  cat >"$PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$LABEL</string>
+  <key>ProgramArguments</key>
+  <array><string>$INSTALLED</string><string>watch</string></array>
+  <key>WatchPaths</key>
+  <array><string>$CAPTURES</string></array>
+  <key>ThrottleInterval</key><integer>1</integer>
+  <key>ProcessType</key><string>Background</string>
+  <key>StandardErrorPath</key><string>$STATE_DIR/launchd.log</string>
+</dict>
+</plist>
+EOF
+  launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null
+  launchctl bootstrap "gui/$(id -u)" "$PLIST" || die "launchd did not load $PLIST"
+  touch "$FLAG"
+  echo "Installed and on. New captures go to $machine. Settings: $CONF"
+}
+
+uninstall() {
+  launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null
+  rm -f "$PLIST" "$FLAG"
+  echo "Removed the launchd job. Settings stay in $CONF_DIR; the script stays at $INSTALLED."
+}
+
+status() {
+  local job=stopped
+  launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1 && job=loaded
+  if [ -e "$FLAG" ]; then echo "on"; else echo "off"; fi
+  echo "launchd job: $job"
+  echo "machine: ${MACHINE:-not set}  model: $MODEL  effort: $EFFORT  cwd: ${CWD:-home}"
+  [ -f "$LOG" ] && tail -3 "$LOG"
+  return 0
+}
+
+case "${1:-}" in
+  install) install "${2:-}" ;;
+  uninstall) uninstall ;;
+  on) mkdir -p "$CONF_DIR" && touch "$FLAG" && echo "on: new captures go to ${MACHINE:-the machine in $CONF}" ;;
+  off) rm -f "$FLAG" && echo "off: captures stay on the Mac" ;;
+  status) status ;;
+  send) send "${2:-$(newest_bundle)}" ;;
+  watch) watch ;;
+  *)
+    sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'
+    exit 2
+    ;;
+esac
