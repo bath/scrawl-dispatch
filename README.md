@@ -4,6 +4,11 @@ Sends each finished [Scrawl](https://github.com/kitlangton/scrawl) capture to a 
 [Herdr](https://herdr.dev) machine. You finish a recording; about 5 seconds later Claude Code is
 working on it in a new Herdr tab on your code box.
 
+[![Mock demo of the workflow: record on the Mac, finish, and Claude Code starts in a new Herdr tab on the code box](demo/demo.gif)](demo/demo.mp4)
+
+The demo is an illustration drawn by [`demo/make-demo.py`](demo/make-demo.py), not a screen
+recording. The 4.9 seconds in it is the time measured in a test with a simulated capture.
+
 Scrawl has no "capture is done" hook yet
 ([kitlangton/scrawl#25](https://github.com/kitlangton/scrawl/issues/25)), so this is a launchd job
 that watches the captures folder. Scrawl itself is not changed.
