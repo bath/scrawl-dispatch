@@ -16,14 +16,15 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
 
-W, H, S, FPS, SECONDS = 1280, 720, 2, 20, 18.5
+W, H, S, FPS, SECONDS = 1280, 720, 2, 60, 18.5
+GIF_FPS = 50  # the fastest a GIF can go: its frame delay is in hundredths of a second
 OUT = Path(__file__).parent
 
 BG = (15, 17, 21)
-PANEL = (27, 30, 37)
-EDGE = (52, 57, 68)
-TEXT = (232, 234, 240)
-DIM = (140, 147, 162)
+PANEL = (38, 42, 54)
+EDGE = (104, 112, 132)
+TEXT = (250, 250, 252)
+DIM = (196, 201, 214)
 RED = (255, 69, 58)
 GREEN = (62, 207, 142)
 AMBER = (240, 180, 70)
@@ -38,7 +39,8 @@ def font(size, mono=False):
     key = (size, mono)
     if key not in _fonts:
         path = "/System/Library/Fonts/Menlo.ttc" if mono else "/System/Library/Fonts/SFNS.ttf"
-        _fonts[key] = ImageFont.truetype(path, size * S)
+        # Every size is drawn 20% larger: the README shows the GIF at about two thirds of full size.
+        _fonts[key] = ImageFont.truetype(path, round(size * 1.2 * S))
     return _fonts[key]
 
 
@@ -113,7 +115,7 @@ def mac(c, t):
     for i, (label, value) in enumerate([("Done", "100%"), ("Billed so far", "$0"), ("Budget", "$4,200")]):
         cx = x + 34 + i * 172
         c.box(cx, y + 196, 150, 86, (255, 255, 255), 8, (225, 222, 214))
-        c.text(cx + 14, y + 212, label, 11, (120, 122, 130))
+        c.text(cx + 14, y + 212, label, 11, (84, 86, 96))
         c.text(cx + 14, y + 236, value, 21, INK)
     for i in range(3):
         c.box(x + 34, y + 308 + i * 30, w - 68 - i * 90, 12, (228, 225, 217), 6)
@@ -151,7 +153,7 @@ def mac(c, t):
     if t > ARRIVE - 0.2:
         k = span(t, ARRIVE - 0.2, ARRIVE + 0.3)
         nx = x + w - 236 + (1 - k) * 60
-        c.box(nx, y + 90, 222, 50, mix(PAGE, (36, 38, 46), k), 12, EDGE)
+        c.box(nx, y + 90, 222, 54, mix(PAGE, (24, 26, 32), k), 12, EDGE)
         c.text(nx + 14, y + 106, "Scrawl sent to code-box", 12, mix(PAGE, TEXT, k), anchor="lm")
         c.text(nx + 14, y + 124, "A new tab is working on it", 11, mix(PAGE, DIM, k), anchor="lm")
 
@@ -198,7 +200,7 @@ def code_box(c, t):
     side = 138
     c.line([(x + side, y + 34), (x + side, y + h)], EDGE, 1)
     c.text(x + 16, y + 56, "Spaces", 11, DIM)
-    c.box(x + 10, y + 70, side - 20, 26, (40, 44, 54), 6)
+    c.box(x + 10, y + 70, side - 20, 26, (64, 70, 88), 6)
     c.text(x + 22, y + 83, "code-box", 12, TEXT, anchor="lm")
     c.text(x + 16, y + 124, "Agents", 11, DIM)
     agents = [("fix flaky test", DIM), ("review PR 212", DIM)]
@@ -216,47 +218,47 @@ def code_box(c, t):
             break
         active = (i == 2) if opened > 0 else (i == 1)
         tw = 62 * (opened if i == 2 else 1)
-        c.box(tx, y + 42, tw, 26, (44, 48, 60) if active else PANEL, 6, CLAY if (i == 2 and t < ARRIVE + 1.6) else EDGE)
+        c.box(tx, y + 42, tw, 26, (70, 76, 96) if active else PANEL, 6, CLAY if (i == 2 and t < ARRIVE + 1.6) else EDGE)
         if tw > 40:
             c.dot(tx + 16, y + 55, 4, CLAY)
             c.text(tx + 30, y + 55, str(i + 1), 12, TEXT if active else DIM, anchor="lm")
         tx += tw + 6
 
     # The terminal of the active tab.
-    c.box(x + side + 12, y + 76, w - side - 24, h - 88, (18, 20, 25), 8, EDGE)
+    c.box(x + side + 12, y + 76, w - side - 24, h - 88, (8, 9, 12), 8, EDGE)
     lx, ly = x + side + 26, y + 96
     if opened == 0:
         c.text(lx, ly, "$ pnpm test --watch", 12, DIM, mono=True)
-        c.text(lx, ly + 20, "  412 passed", 12, (70, 110, 85), mono=True)
+        c.text(lx, ly + 24, "  412 passed", 12, GREEN, mono=True)
         return
     for start, line, colour in TERMINAL:
         since = t - ARRIVE - 0.4 - start
         if since <= 0:
             break
         c.text(lx, ly, line[: int(since * 60)], 12, colour, mono=True)
-        ly += 21
+        ly += 24
 
 
 def transfer(c, t):
     """The capture travelling from the Mac to the code box, and the time since finish."""
     y = 560
-    c.line([(MAC[0] + MAC[2] / 2, y), (BOX[0] + BOX[2] / 2, y)], EDGE, 2)
+    c.line([(MAC[0] + MAC[2] / 2, y), (BOX[0] + BOX[2] / 2, y)], EDGE, 3)
     c.dot(MAC[0] + MAC[2] / 2, y, 5, EDGE)
     c.dot(BOX[0] + BOX[2] / 2, y, 5, EDGE)
-    c.text(W / 2, y - 14, "SSH", 11, DIM, anchor="mm")
+    c.text(W / 2, y - 26, "SSH", 11, DIM, anchor="mm")
     if FINISH + 0.9 < t < ARRIVE + 0.2:
         k = span(t, FINISH + 1.1, ARRIVE - 0.5)
         px = MAC[0] + MAC[2] / 2 + (BOX[0] + BOX[2] / 2 - MAC[0] - MAC[2] / 2) * k
         label = "contact sheet · frames · summary"
         width = c.width(label, 12) + 28
-        c.box(px - width / 2, y - 14, width, 28, (44, 48, 60), 14, CLAY)
+        c.box(px - width / 2, y - 16, width, 32, (64, 70, 88), 16, CLAY)
         c.text(px, y, label, 12, TEXT, anchor="mm")
     if t >= FINISH:
         # The 4.4 seconds shown here stand for the 4.9 measured in the real test.
         elapsed = min(t, ARRIVE) - FINISH
         shown = elapsed / (ARRIVE - FINISH) * 4.9
         done = t >= ARRIVE
-        c.text(W / 2, y + 22, f"{shown:.1f} s since finish", 13, GREEN if done else AMBER, anchor="mm")
+        c.text(W / 2, y + 28, f"{shown:.1f} s since finish", 14, GREEN if done else AMBER, anchor="mm")
 
 
 STEPS = [
@@ -309,7 +311,7 @@ def main():
         sys.exit("ffmpeg failed")
     subprocess.run(
         ["ffmpeg", "-y", "-loglevel", "error", "-i", str(mp4), "-vf",
-         "fps=10,scale=960:-1:flags=lanczos,split[a][b];[a]palettegen=max_colors=96[p];[b][p]paletteuse=dither=bayer:bayer_scale=4",
+         f"fps={GIF_FPS},scale=960:-1:flags=lanczos,split[a][b];[a]palettegen=max_colors=128[p];[b][p]paletteuse=dither=none:diff_mode=rectangle",
          str(gif)],
         check=True,
     )
